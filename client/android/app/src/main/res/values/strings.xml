@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">SPSI</string>
+    <string name="title_activity_main">SPSI</string>
+    <string name="package_name">com.spsi.android</string>
+    <string name="custom_url_scheme">com.spsi.android</string>
+</resources>

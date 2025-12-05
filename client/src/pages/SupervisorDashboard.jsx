@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import axios from "axios";
 import PropTypes from "prop-types";
 import Navbar from "../components/Navbar";
@@ -10,10 +10,20 @@ import {
   AlertCircle,
   Send,
   Edit2,
-  Camera,
+  Camera as CameraIcon, // Renamed to avoid conflict with Capacitor Camera
   UploadCloud,
+  WifiOff,
+  RefreshCw,
 } from "lucide-react";
 import { API_ENDPOINTS } from "../config/api";
+import { Camera, CameraResultType, CameraSource } from "@capacitor/camera";
+import { Geolocation } from "@capacitor/geolocation";
+import { Network } from "@capacitor/network";
+import {
+  saveOfflineSubmission,
+  getOfflineSubmissions,
+  removeOfflineSubmission,
+} from "../services/offlineStorage";
 
 export default function SupervisorDashboard() {
   const { user } = useAuth();
@@ -25,6 +35,11 @@ export default function SupervisorDashboard() {
     saltPrice: "",
   });
   const [selectedFiles, setSelectedFiles] = useState([]);
+
+  // Offline & Network State
+  const [isOnline, setIsOnline] = useState(true);
+  const [offlineSubmissions, setOfflineSubmissions] = useState([]);
+  const [isSyncing, setIsSyncing] = useState(false);
 
   // Editing/Resubmitting State
   const [editingId, setEditingId] = useState(null);
@@ -39,13 +54,39 @@ export default function SupervisorDashboard() {
   const grandTotal = totalSugar + totalSalt;
 
   useEffect(() => {
+    checkNetworkStatus();
+    loadOfflineSubmissions();
     fetchSubmissions();
+
+    // Listen for network changes
+    const logNetworkStatus = Network.addListener(
+      "networkStatusChange",
+      (status) => {
+        setIsOnline(status.connected);
+        if (status.connected) {
+          fetchSubmissions(); // Refresh list when back online
+        }
+      }
+    );
+
+    return () => {
+      logNetworkStatus.remove();
+    };
   }, [user]);
 
+  const checkNetworkStatus = async () => {
+    const status = await Network.getStatus();
+    setIsOnline(status.connected);
+  };
+
+  const loadOfflineSubmissions = async () => {
+    const offline = await getOfflineSubmissions();
+    setOfflineSubmissions(offline);
+  };
+
   const fetchSubmissions = async () => {
-    if (!user) return;
+    if (!user || !isOnline) return;
     try {
-      // Use userId if available, otherwise use email
       const userId = user.userId || user.email;
       const res = await axios.get(
         `${API_ENDPOINTS.submissions}?role=supervisor&userId=${userId}`
@@ -65,27 +106,105 @@ export default function SupervisorDashboard() {
     }
   };
 
+  const takePhoto = async () => {
+    try {
+      const photo = await Camera.getPhoto({
+        quality: 90,
+        allowEditing: false,
+        resultType: CameraResultType.Uri,
+        source: CameraSource.Prompt, // Prompts user to choose Camera or Photos
+      });
+
+      // Convert webPath to Blob
+      const response = await fetch(photo.webPath);
+      const blob = await response.blob();
+      const file = new File([blob], `photo_${Date.now()}.jpeg`, {
+        type: "image/jpeg",
+      });
+
+      setSelectedFiles((prev) => [...prev, file]);
+    } catch (error) {
+      console.error("Camera error:", error);
+    }
+  };
+
+  const getGeoLocation = async () => {
+    try {
+      const permission = await Geolocation.checkPermissions();
+      if (permission.location === 'prompt' || permission.location === 'prompt-with-rationale') {
+          const request = await Geolocation.requestPermissions();
+          if(request.location !== 'granted') return null;
+      }
+
+      const coordinates = await Geolocation.getCurrentPosition();
+      return `Lat: ${coordinates.coords.latitude}, Long: ${coordinates.coords.longitude}`;
+    } catch (e) {
+      console.warn("Geolocation failed", e);
+      return null;
+    }
+  };
+
   const handleSubmit = async (e) => {
     e.preventDefault();
+    
+    // Get location just before submitting
+    const locationStr = await getGeoLocation();
+    const currentSupervisorId = user.userId || user.email;
+    
+    const submissionData = {
+      supervisorId: currentSupervisorId,
+      supervisorName: user.name,
+      sugarQty: formData.sugarQty,
+      sugarPrice: formData.sugarPrice,
+      saltQty: formData.saltQty,
+      saltPrice: formData.saltPrice,
+      // Append location to remarks if available, or just keep existing logic?
+      // Since we can't easily change backend schema, let's log it or ignore for now
+      // properly handling it would require backend change. 
+      // For now, let's assume we just send standard data.
+      // We can append it to a 'remarks' field if we had one in the form, but we don't.
+      // We'll just proceed with standard data for now to ensure compatibility.
+    };
+
+    if (!isOnline) {
+      // Offline Mode: Save to Local Storage
+      try {
+        const offlineData = {
+            ...submissionData,
+            files: selectedFiles, // specialized handling needed for files? idb-keyval handles blobs.
+            location: locationStr
+        };
+        
+        await saveOfflineSubmission(offlineData);
+        alert("Offline: Submission saved locally. Sync when online.");
+        setFormData({ sugarQty: "", sugarPrice: "", saltQty: "", saltPrice: "" });
+        setSelectedFiles([]);
+        loadOfflineSubmissions();
+      } catch (err) {
+        console.error("Error saving offline:", err);
+        alert("Failed to save offline submission.");
+      }
+      return;
+    }
+
+    // Online Mode: Send to API
     try {
-      // Use userId if available, otherwise use email
-      const supervisorId = user.userId || user.email;
-
       const data = new FormData();
-      data.append("supervisorId", supervisorId);
-      data.append("supervisorName", user.name);
-      data.append("sugarQty", formData.sugarQty);
-      data.append("sugarPrice", formData.sugarPrice);
-      data.append("saltQty", formData.saltQty);
-      data.append("saltPrice", formData.saltPrice);
+      Object.keys(submissionData).forEach(key => {
+        data.append(key, submissionData[key]);
+      });
 
-      // Append files
+      if (locationStr) {
+          // Hack: appending to a field if possible, or just console log
+          // If backend doesn't accept extra fields, this might be ignored
+          // data.append("location", locationStr); 
+      }
+
       selectedFiles.forEach((file) => {
         data.append("photos", file);
       });
 
       if (isResubmitting && editingId) {
-        // For resubmission, use FormData to support file uploads
         await axios.put(`${API_ENDPOINTS.submissions}/${editingId}`, data, {
           headers: { "Content-Type": "multipart/form-data" },
         });
@@ -104,13 +223,51 @@ export default function SupervisorDashboard() {
       fetchSubmissions();
     } catch (err) {
       console.error("Error submitting data:", err);
-      // Display detailed error message from backend
-      if (err.response && err.response.data && err.response.data.message) {
-        alert(`Error submitting data: ${err.response.data.message}`);
+      if (err.response?.data?.message) {
+        alert(`Error: ${err.response.data.message}`);
       } else {
         alert("Error submitting data. Please try again.");
       }
     }
+  };
+
+  const handleSync = async () => {
+    if (offlineSubmissions.length === 0) return;
+    setIsSyncing(true);
+
+    for (const sub of offlineSubmissions) {
+      try {
+        const data = new FormData();
+        data.append("supervisorId", sub.supervisorId);
+        data.append("supervisorName", sub.supervisorName);
+        data.append("sugarQty", sub.sugarQty);
+        data.append("sugarPrice", sub.sugarPrice);
+        data.append("saltQty", sub.saltQty);
+        data.append("saltPrice", sub.saltPrice);
+        
+        // Append files (which are stored as Blobs/Files in IDB)
+        if (sub.files && sub.files.length > 0) {
+             sub.files.forEach((file) => {
+                data.append("photos", file);
+             });
+        }
+
+        await axios.post(API_ENDPOINTS.submissions, data, {
+          headers: { "Content-Type": "multipart/form-data" },
+        });
+
+        // Remove from offline storage after success
+        await removeOfflineSubmission(sub.id);
+      } catch (err) {
+        console.error(`Failed to sync submission ${sub.id}:`, err);
+        // Continue to next item even if one fails
+      }
+    }
+
+    setIsSyncing(false);
+    loadOfflineSubmissions();
+    fetchSubmissions();
+    alert("Sync process completed.");
   };
 
   const handleEdit = (submission) => {
@@ -130,6 +287,39 @@ export default function SupervisorDashboard() {
       <Navbar />
 
       <main className="max-w-7xl mx-auto px-3 sm:px-4 lg:px-8 py-6 sm:py-8">
+        
+        {/* Offline Status Banner */}
+        {!isOnline && (
+          <div className="mb-6 p-4 bg-amber-100 dark:bg-amber-900/30 border border-amber-200 dark:border-amber-800/50 rounded-xl flex items-center gap-3 text-amber-800 dark:text-amber-400">
+            <WifiOff size={24} />
+            <div>
+              <h3 className="font-bold">You are currently Offline</h3>
+              <p className="text-sm">Submissions will be saved locally and can be synced when you are back online.</p>
+            </div>
+          </div>
+        )}
+
+        {/* Pending Sync Banner */}
+        {isOnline && offlineSubmissions.length > 0 && (
+          <div className="mb-6 p-4 bg-blue-100 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800/50 rounded-xl flex items-center justify-between text-blue-800 dark:text-blue-400">
+            <div className="flex items-center gap-3">
+              <UploadCloud size={24} />
+              <div>
+                <h3 className="font-bold">{offlineSubmissions.length} Offline Submission(s) Pending</h3>
+                <p className="text-sm">Upload them to the server now.</p>
+              </div>
+            </div>
+            <button 
+              onClick={handleSync}
+              disabled={isSyncing}
+              className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold flex items-center gap-2 disabled:opacity-50"
+            >
+               {isSyncing ? <RefreshCw className="animate-spin" size={18}/> : <UploadCloud size={18}/>}
+               {isSyncing ? "Syncing..." : "Sync Now"}
+            </button>
+          </div>
+        )}
+
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 sm:gap-6 lg:gap-8">
           {/* Input Form */}
           <div className="lg:col-span-1">
@@ -258,28 +448,19 @@ export default function SupervisorDashboard() {
                     </button>
 
                     <label
-                      htmlFor="camera-capture"
                       className="text-xs font-semibold text-slate-500 dark:text-slate-400 block mb-1 ml-0.5 sm:mb-1.5 cursor-pointer"
+                      onClick={takePhoto}
                     >
-                      Take Photo
+                      Take Photo (Camera)
                     </label>
-                    <input
-                      id="camera-capture"
-                      type="file"
-                      accept="image/*"
-                      capture="environment" // This attribute directly opens the camera
-                      className="hidden"
-                      onChange={handleFileChange}
-                    />
+                    
                     <button
                       type="button"
-                      onClick={() =>
-                        document.getElementById("camera-capture").click()
-                      }
+                      onClick={takePhoto}
                       className="flex items-center justify-center px-2 sm:px-3 py-1.5 sm:py-2 rounded-lg sm:rounded-xl bg-indigo-100 text-indigo-700 hover:bg-indigo-200 dark:bg-indigo-900/50 dark:text-indigo-300 dark:hover:bg-indigo-800/50 transition-all text-xs sm:text-sm font-semibold"
                       title="Open Camera"
                     >
-                      <Camera size={16} sm:size={20} />
+                      <CameraIcon size={16} sm:size={20} />
                     </button>
                   </div>
 
@@ -323,10 +504,10 @@ export default function SupervisorDashboard() {
 
                 <button
                   type="submit"
-                  className="w-full bg-gradient-to-r from-blue-600 to-teal-500 hover:from-blue-700 hover:to-teal-600 text-white py-2.5 sm:py-3.5 rounded-lg sm:rounded-xl font-bold shadow-lg shadow-blue-500/25 hover:shadow-blue-500/40 transition-all active:scale-[0.98] flex items-center justify-center gap-2"
+                  className={`w-full bg-gradient-to-r ${!isOnline ? "from-amber-600 to-orange-500" : "from-blue-600 to-teal-500 hover:from-blue-700 hover:to-teal-600"} text-white py-2.5 sm:py-3.5 rounded-lg sm:rounded-xl font-bold shadow-lg shadow-blue-500/25 hover:shadow-blue-500/40 transition-all active:scale-[0.98] flex items-center justify-center gap-2`}
                 >
                   <Send size={16} sm:size={20} />
-                  {isResubmitting ? "Update & Resubmit" : "Submit Data"}
+                  {isResubmitting ? "Update & Resubmit" : (!isOnline ? "Save Offline" : "Submit Data")}
                 </button>
 
                 {isResubmitting && (
